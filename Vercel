@@ -1,0 +1,258 @@
+We’ll adapt **QuantumSecure EliteClean** for deployment on **Vercel** (frontend) and **Supabase** (database, auth, storage). The backend (FastAPI + LangGraph + ONNX) will run as a separate service (e.g., on Render, Railway, or as a Vercel Python Serverless Function with limitations). All configuration files are provided below.
+
+---
+
+## 1. Frontend – Vercel Deployment
+
+### `frontend/vercel.json`
+
+Place this in the `frontend/` directory:
+
+```json
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "framework": "nextjs"
+}
+```
+
+### Frontend Environment Variables (Vercel)
+
+Set these in your Vercel project dashboard:
+
+- `NEXT_PUBLIC_API_BASE` – URL of your backend service (e.g., `https://your-backend.onrender.com`)
+- `NEXT_PUBLIC_SUPABASE_URL` – Your Supabase project URL
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY` – Your Supabase anon/public key
+- `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` – Your Google Maps API key
+
+---
+
+## 2. Backend – Supabase Integration
+
+The backend (FastAPI) will use **Supabase PostgreSQL** for data storage. We’ll replace the local Postgres connection with Supabase’s connection pooler. Neo4j and Redis are not part of Supabase; they must remain as separate services or be replaced with Supabase equivalents (e.g., use Supabase’s built‑in features for rate limiting and graph data).
+
+### 2.1 Supabase Schema
+
+Run this SQL in your Supabase SQL editor to create the required tables:
+
+```sql
+-- Enable pgcrypto for UUID generation
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Tenants table
+CREATE TABLE tenants (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Users table (extends Supabase auth.users)
+CREATE TABLE profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+  full_name TEXT,
+  avatar_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Bookings table
+CREATE TABLE bookings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
+  service_type TEXT NOT NULL,
+  price DECIMAL(10,2) NOT NULL,
+  quantum_signature TEXT,
+  status TEXT DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Interactions (for LangGraph logging)
+CREATE TABLE interactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES profiles(id) ON DELETE SET NULL,
+  intent TEXT,
+  risk_score FLOAT,
+  price DECIMAL(10,2),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Optional: Enable Row Level Security (RLS)
+ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bookings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE interactions ENABLE ROW LEVEL SECURITY;
+
+-- Example RLS policies (adjust as needed)
+CREATE POLICY "Users can view their own tenant" ON tenants
+  FOR SELECT USING (auth.uid() IN (SELECT id FROM profiles WHERE tenant_id = tenants.id));
+```
+
+### 2.2 Backend Modifications
+
+Update the backend to use Supabase PostgreSQL. We’ll keep using SQLAlchemy but point it to Supabase.
+
+#### `backend/app/core/database.py` (new file)
+
+```python
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase connection string (with pooler)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+```
+
+#### Update `backend/app/main.py` to use Supabase session
+
+Add a dependency to get DB session.
+
+#### Remove Neo4j and Redis dependencies (or keep them if you deploy them separately)
+
+If you want to keep Neo4j for graph features, you’ll need to host it elsewhere (e.g., Neo4j Aura). Redis for rate limiting can be replaced with Supabase’s `pg_net` extension or use an in‑memory store (not recommended for production). For simplicity, we’ll comment out Neo4j and Redis and rely on PostgreSQL for now.
+
+#### Modify `backend/app/agents/cleangeniusagent.py` to log to Supabase instead of Neo4j
+
+Create a new logging function in `database.py`:
+
+```python
+def log_interaction_db(tenant_id, user_id, intent, risk_score, price):
+    from sqlalchemy.sql import text
+    with SessionLocal() as session:
+        session.execute(
+            text("""
+                INSERT INTO interactions (tenant_id, user_id, intent, risk_score, price)
+                VALUES (:tenant_id, :user_id, :intent, :risk_score, :price)
+            """),
+            {"tenant_id": tenant_id, "user_id": user_id, "intent": intent, "risk_score": risk_score, "price": price}
+        )
+        session.commit()
+```
+
+Then replace `neo4j_log_node` with a call to this function.
+
+#### Update `backend/requirements.txt` to include `psycopg2-binary` (already present) and `asyncpg` if needed.
+
+### 2.3 Environment Variables for Backend
+
+- `DATABASE_URL` – Supabase connection string (from project settings → Database → Connection string, with password)
+- `SUPABASE_JWT_SECRET` – For verifying Supabase auth tokens (optional)
+
+---
+
+## 3. Deploy Backend Separately
+
+Since Vercel is not ideal for running a full Python backend (especially with LangGraph and ONNX), we recommend deploying the backend on:
+
+- **Render** (easy, free tier)
+- **Railway**
+- **Fly.io**
+- **Google Cloud Run**
+- **AWS Fargate**
+
+Create a `render.yaml` or `railway.json` configuration if desired.
+
+### Example `render.yaml` for backend
+
+```yaml
+services:
+  - type: web
+    name: quantumsecure-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: quantumsecure-db
+          property: connectionString
+      - key: REDIS_URL
+        value: redis://redistogo:... # optional, if you keep Redis
+```
+
+---
+
+## 4. Supabase Auth Integration
+
+In the frontend, use Supabase Auth to manage users. Modify `CleanGeniusOrb.tsx` to include the current user’s session when calling the backend.
+
+Example: Add a Supabase client and pass the access token to the backend.
+
+```tsx
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+// When sending a chat request
+const { data: { session } } = await supabase.auth.getSession()
+const headers = {
+  'Content-Type': 'application/json',
+  'Authorization': `Bearer ${session?.access_token}`
+}
+```
+
+On the backend, verify the JWT using `supabase` library or `jose`. Add middleware to extract tenant/user from the token.
+
+---
+
+## 5. Environment Variables Summary
+
+| Variable | Where | Purpose |
+|----------|-------|---------|
+| `NEXT_PUBLIC_API_BASE` | Vercel (frontend) | URL of backend service |
+| `NEXT_PUBLIC_SUPABASE_URL` | Vercel | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Vercel | Supabase anon key |
+| `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` | Vercel | Google Maps API key |
+| `DATABASE_URL` | Backend host | Supabase connection string |
+| `SUPABASE_JWT_SECRET` | Backend host | For verifying JWT (optional) |
+| `REDIS_URL` | Backend host | If you keep Redis |
+| `NEO4J_URI` | Backend host | If you keep Neo4j |
+
+---
+
+## 6. File Additions/Modifications Summary
+
+- `frontend/vercel.json`
+- `frontend/lib/supabaseClient.ts` (create this)
+- `backend/app/core/database.py`
+- Update `backend/app/main.py` to use Supabase session and auth
+- Update `backend/app/agents/cleangeniusagent.py` to log to PostgreSQL
+- Remove or conditionally disable Neo4j/Redis if not used
+
+---
+
+## 7. Full Deployment Steps
+
+1. **Set up Supabase**  
+   - Create a project  
+   - Run the SQL schema  
+   - Note the project URL, anon key, and database connection string
+
+2. **Deploy backend** (Render, Railway, etc.)  
+   - Push code to a Git repository  
+   - Connect to your chosen platform  
+   - Set environment variables  
+   - Deploy
+
+3. **Deploy frontend to Vercel**  
+   - Connect your frontend Git repo  
+   - Add environment variables  
+   - Deploy
+
+4. **Configure custom domain** (optional)
+
+5. **Test end‑to‑end**
+
+---
+
+This setup gives you a scalable, serverless‑friendly architecture with Vercel for the frontend and Supabase for database/auth, while keeping your custom AI backend as a separate microservice.
