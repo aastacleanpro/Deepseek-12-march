@@ -1,0 +1,46 @@
+# Dockerfile.tencent
+# Multi‑stage build for QuantumSecure EliteClean (backend + frontend in one container)
+# Suitable for Tencent Cloud container deployments
+
+# ---- Stage 1: Build Frontend ----
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Stage 2: Build Backend Dependencies ----
+FROM python:3.11-slim AS backend-builder
+WORKDIR /app/backend
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- Stage 3: Final Image ----
+FROM python:3.11-slim
+
+# Install supervisor to run both processes
+RUN apt-get update && apt-get install -y supervisor && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy backend code and installed dependencies
+COPY --from=backend-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=backend-builder /usr/local/bin /usr/local/bin
+COPY backend/ ./backend/
+
+# Copy frontend build and dependencies
+COPY --from=frontend-builder /app/frontend/.next ./frontend/.next
+COPY --from=frontend-builder /app/frontend/node_modules ./frontend/node_modules
+COPY --from=frontend-builder /app/frontend/package.json ./frontend/package.json
+COPY --from=frontend-builder /app/frontend/public ./frontend/public
+
+# Copy supervisor configuration
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Expose ports (backend 8000, frontend 3000)
+EXPOSE 8000 3000
+
+# Start supervisor
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
